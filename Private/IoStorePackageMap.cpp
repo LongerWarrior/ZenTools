@@ -5,6 +5,11 @@
 #include "Serialization/MemoryReader.h"
 #include "IO/IoContainerHeader.h"
 
+void FIoStorePackageMap::SetDefaultZenPackageVersion(EZenPackageVersion NewDefaultPackageVersion)
+{
+	DefaultZenPackageVersion = NewDefaultPackageVersion;
+}
+
 void FIoStorePackageMap::PopulateFromContainer(const TSharedPtr<FIoStoreReader>& Reader)
 {
 	// If this is a global container, read the Script Objects from it
@@ -65,7 +70,8 @@ void FIoStorePackageMap::PopulateFromContainer(const TSharedPtr<FIoStoreReader>&
 		
 		TIoStatusOr<FIoStoreTocChunkInfo> ChunkInfo = Reader->GetChunkInfo( ChunkId );
 		TIoStatusOr<FIoBuffer> PackageBuffer = Reader->Read( ChunkId, FIoReadOptions() );
-		check( PackageBuffer.IsOk() );
+		checkf( PackageBuffer.IsOk(), TEXT("Failed to find ChunkId %s for PackageId 0x%llx in ContainerId 0x%llx (ChunkInfo valid: %d)"),
+			*LexToString( ChunkId ), PackageId.ValueForDebugging(), Reader->GetContainerId().Value(), ChunkInfo.IsOk() );
 
 		FPackageMapExportBundleEntry* ExportBundleEntry = ReadExportBundleData( PackageId, ChunkInfo.ValueOrDie(), PackageBuffer.ValueOrDie() );
 
@@ -126,6 +132,15 @@ bool FIoStorePackageMap::FindPackageHeader(const FPackageId& PackageId, FPackage
 		return true;
 	}
 	return false;
+}
+
+FName FIoStorePackageMap::FindPackageName(const FPackageId& PackageId) const
+{
+	if ( const FPackageMapExportBundleEntry* Entry = PackageMap.Find( PackageId ) )
+	{
+		return Entry->PackageName;
+	}
+	return NAME_None;
 }
 
 bool FIoStorePackageMap::FindScriptObject(const FPackageObjectIndex& Index, FPackageMapScriptObjectEntry& OutMapEntry) const
@@ -219,12 +234,29 @@ FPackageMapExportBundleEntry* FIoStorePackageMap::ReadExportBundleData( const FP
 	FMemoryReaderView PackageHeaderDataReader(PackageHeaderDataView);
 
 	TOptional<FZenPackageVersioningInfo> VersioningInfo;
+	EZenPackageVersion ZenPackageVersion = DefaultZenPackageVersion;
+	
 	if (PackageSummary->bHasVersioningInfo)
 	{
 		PackageHeaderDataReader << VersioningInfo.Emplace();
+		ZenPackageVersion = VersioningInfo->ZenVersion;
 	}
+	// Load name map
 	TArray<FDisplayNameEntryId> PackageNameMap = LoadNameBatch(PackageHeaderDataReader);
+	
+	// Load data resource table
+	TArray<FBulkDataMapEntry> ResultBulkDataEntries;
+	if ( ZenPackageVersion >= EZenPackageVersion::DataResourceTable )
+	{
+		int64 BulkDataMapSize = 0;
+		PackageHeaderDataReader << BulkDataMapSize;
+		
+		const uint8* BulkDataMapData = PackageSummaryData + sizeof(FZenPackageSummary) + PackageHeaderDataReader.Tell();
+		TArrayView<const FBulkDataMapEntry> BulkDataEntries = MakeArrayView(reinterpret_cast<const FBulkDataMapEntry*>(BulkDataMapData), BulkDataMapSize / sizeof(FBulkDataMapEntry));
 
+		ResultBulkDataEntries.Append( BulkDataEntries );
+	}
+	
 	const FName PackageName = PackageSummary->Name.ResolveName(PackageNameMap);
 
 	// Find package header to resolve imported package IDs
@@ -237,6 +269,7 @@ FPackageMapExportBundleEntry* FIoStorePackageMap::ReadExportBundleData( const FP
 	PackageData.PackageFlags = PackageSummary->PackageFlags;
 	PackageData.VersioningInfo = VersioningInfo;
 	PackageData.PackageChunkId = ChunkInfo.Id;
+	PackageData.BulkDataResourceTable = ResultBulkDataEntries;
 
 	// get rid of standard filename prefix
 	PackageData.PackageFilename.RemoveFromStart( TEXT("../../../") );
