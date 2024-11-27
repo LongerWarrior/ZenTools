@@ -1,4 +1,4 @@
-﻿// Copyright Nikita Zolotukhin. All Rights Reserved.
+// Copyright Nikita Zolotukhin. All Rights Reserved.
 
 #include "CookedAssetWriter.h"
 #include "IoStorePackageMap.h"
@@ -14,6 +14,7 @@
 #include "UObject/SoftObjectPath.h"
 #include "Misc/FileHelper.h"
 #include "Serialization/JsonSerializer.h"
+#include "UObject/ObjectVersion.h"
 
 FAssetSerializationWriter::FAssetSerializationWriter( FArchive& Ar, FAssetSerializationContext* Context ) : FArchiveProxy( Ar ), Context( Context )
 {
@@ -59,68 +60,86 @@ void FAssetSerializationWriter::SetFilterEditorOnly( bool InFilterEditorOnly )
 	FArchive::SetFilterEditorOnly( InFilterEditorOnly );
 }
 
-FCookedAssetWriter::FCookedAssetWriter(const TSharedPtr<FIoStorePackageMap>& InPackageMap, const FString& InOutputDir) : PackageMap( InPackageMap ), RootOutputDir( InOutputDir ), NumPackagesWritten( 0 )
+FCookedAssetWriter::FCookedAssetWriter(const TSharedPtr<FIoStorePackageMap>& InPackageMap, const TMap<TSharedPtr<FIoStoreReader>, FReadOrder>& ContainerReaders, const FString& InOutputDir) : PackageMap( InPackageMap ), Readers( ContainerReaders ), RootOutputDir( InOutputDir ), NumPackagesWritten( 0 )
 {
 }
 
-void FCookedAssetWriter::WritePackagesFromContainer( const TSharedPtr<FIoStoreReader>& Reader, const FString& PackageFilter )
+void FCookedAssetWriter::WritePackages(const TArray<FString>& FilterStrings)
 {
-	const FIoContainerId ContainerId = Reader->GetContainerId();
-	UE_LOG( LogIoStoreTools, Display, TEXT("Writing asset files for Container %lld"), ContainerId.Value() );
+	const TFunction<bool(const FPackageId&)> PackageFilterFunction = MakePackageFilterFunction(FilterStrings);
 
-	FPackageContainerMetadata ContainerMetadata;
-	if ( PackageMap->FindPackageContainerMetadata( ContainerId, ContainerMetadata ) )
+	for (const TPair<FPackageId, FPackageInfo>& PackageMapEntry : PackageMap->GetNewPackageMap())
 	{
-		const TFunction<bool(const FPackageId&)> PackageFilterFunction = MakePackageFilterFunction( PackageFilter );
-		
-		for ( const FPackageId& PackageId : ContainerMetadata.PackagesInContainer )
+		if (PackageFilterFunction(PackageMapEntry.Key))
 		{
-			if ( PackageFilterFunction( PackageId ) )
-			{
-				WriteSinglePackage( PackageId, false, Reader );
-			}
-		}
-		for ( const FPackageId& OptionalPackageId : ContainerMetadata.OptionalPackagesInContainer )
-		{
-			if ( PackageFilterFunction( OptionalPackageId ) )
-			{
-				WriteSinglePackage( OptionalPackageId, true, Reader );
-			}
+			WriteSinglePackage(PackageMapEntry.Key, PackageMapEntry.Value);
 		}
 	}
 }
 
-TFunction<bool(const FPackageId&)> FCookedAssetWriter::MakePackageFilterFunction(const FString& PackageFilter) const
+TFunction<bool(const FPackageId&)> FCookedAssetWriter::MakePackageFilterFunction(const TArray<FString>& FilterStrings) const
 {
-	// No filter is specified, we write all packages
-	if ( PackageFilter.IsEmpty() )
+	TArray<FString> IncludeStrings;
+	TArray<FString> ExcludeStrings;
+
+	for (const FString& FilterString : FilterStrings)
+	{
+		FString TrimmedString = FilterString.TrimStartAndEnd();
+		if (TrimmedString.IsEmpty())
+			continue;
+
+		if (TrimmedString.StartsWith("!"))
+		{
+			ExcludeStrings.Add(TrimmedString.Mid(1));
+		}
+		else
+		{
+			IncludeStrings.Add(TrimmedString);
+		}
+	}
+
+	if (IncludeStrings.IsEmpty() && ExcludeStrings.IsEmpty())
 	{
 		return [](const FPackageId&) { return true; };
 	}
 
-	// Regex match filter
-	if ( PackageFilter.StartsWith("!") )
+	return [this, IncludeStrings, ExcludeStrings](const FPackageId& PackageId)
 	{
-		const FRegexPattern RegexPattern( PackageFilter.RightChop( 1 ) );
-		
-		return [this, RegexPattern](const FPackageId& PackageId )
-		{
-			const FName PackageName = PackageMap->FindPackageName( PackageId );
-			FRegexMatcher RegexMatcher( RegexPattern, PackageName.ToString() );
-
-			return RegexMatcher.FindNext();
-		};
-	}
-
-	// Normal prefix-based match filter
-	return [this, PackageFilter](const FPackageId& PackageId )
-	{
-		const FName PackageName = PackageMap->FindPackageName( PackageId );
-
+		const FName PackageName = PackageMap->FindPackageName(PackageId);
 		TStringBuilder<256> PackageNameBuffer;
-		PackageName.ToString( PackageNameBuffer );
+		PackageName.ToString(PackageNameBuffer);
 
-		return PackageNameBuffer.ToView().StartsWith( PackageFilter );
+		bool result = false;
+		if (IncludeStrings.IsEmpty())
+		{
+			result = true;
+		}
+		else
+		{
+			for (const FString& IncludeString : IncludeStrings)
+			{
+				if (PackageNameBuffer.ToView().StartsWith(IncludeString))
+				{
+					result = true;
+					break;
+				}
+			}
+			if (!result)
+			{
+				return result;
+			}
+		}
+
+		for (const FString& ExcludeString : ExcludeStrings)
+		{
+			if (PackageNameBuffer.ToView().StartsWith(ExcludeString))
+			{
+				result = false;
+				break;
+			}
+		}
+
+		return result;
 	};
 }
 
@@ -199,77 +218,110 @@ void FCookedAssetWriter::WritePackageStoreManifest() const
 	UE_LOG( LogIoStoreTools, Display, TEXT("Written PackageStore Manifest to '%s'"), *PackageStoreFilename );
 }
 
-void FCookedAssetWriter::WriteSinglePackage( FPackageId PackageId, bool bIsOptionalSegmentPackage, const TSharedPtr<FIoStoreReader>& Reader )
+void FCookedAssetWriter::WriteResponseFiles() const
+{
+	TStringBuilder<256> ResponseFileEntryBuilder;
+	for (const TPair<FString, TArray<FString>>& PackagesMap : SavedPackages)
+	{
+		if (PackagesMap.Value.IsEmpty())
+			continue;
+
+		ResponseFileEntryBuilder.Reset();
+		FString FilePath = FString::Printf(TEXT("%s/ResponseFile_%s.txt"), *RootOutputDir, *PackagesMap.Key);
+		FString Root = RootOutputDir.Replace(TEXT("/"), TEXT("\\"));
+
+		for (const FString& PackageName : PackagesMap.Value)
+		{
+			ResponseFileEntryBuilder << TEXT("\"") << Root << TEXT("\\");
+			if (PackageName.StartsWith(TEXT("../../../")))
+			{
+				ResponseFileEntryBuilder << PackageName.RightChop(9).Replace(TEXT("/"), TEXT("\\")) << TEXT("\" \"");
+			}
+			else
+			{
+				ResponseFileEntryBuilder << PackageName.Replace(TEXT("/"), TEXT("\\")) << TEXT("\" \"../../../");
+			}
+			ResponseFileEntryBuilder << PackageName << TEXT("\" -compress") << LINE_TERMINATOR;
+		}
+		FFileHelper::SaveStringToFile(ResponseFileEntryBuilder.ToString(), *FilePath);
+	}
+}
+
+void FCookedAssetWriter::WriteSinglePackage(FPackageId PackageId, const FPackageInfo& PackageInfo)
 {
 	FPackageMapExportBundleEntry ExportBundleEntry;
-	checkf( PackageMap->FindExportBundleData( PackageId, ExportBundleEntry ), TEXT("Failed to find export bundle entry for PackageId %lld"), PackageId.ValueForDebugging() );
-	
-	const FString PackageFilename = RootOutputDir / ExportBundleEntry.PackageFilename;
-	IFileManager::Get().MakeDirectory( *FPaths::GetPath( PackageFilename ), true );
+	TSharedPtr<FIoStoreReader> Reader;
+	checkf(PackageMap->FindExportBundleDataAndReader(PackageId, ExportBundleEntry, Reader), TEXT("Failed to find export bundle entry for PackageId %lld"), PackageId.ValueForDebugging());
 
-	UE_LOG( LogIoStoreTools, Display, TEXT("Beginning writing package '%s' (0x%llx) to file '%s'"), *ExportBundleEntry.PackageName.ToString(), PackageId.Value(), *ExportBundleEntry.PackageFilename );
+	SavedPackages.FindOrAdd(GetReaderName(Reader)).Add(ExportBundleEntry.PackageFilename);
+
+	const FString PackageFilename = RootOutputDir / ExportBundleEntry.PackageFilename;
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(PackageFilename), true);
+
+	UE_LOG(LogIoStoreTools, Display, TEXT("Beginning writing package '%s' (0x%llx) to file '%s'"), *ExportBundleEntry.PackageName.ToString(), PackageId.Value(), *ExportBundleEntry.PackageFilename);
 
 	// Initialize serialization context
 	FAssetSerializationContext SerializationContext{};
-	
+
 	SerializationContext.PackageId = PackageId;
 	SerializationContext.PackageHeaderFilename = PackageFilename;
 	SerializationContext.BundleData = &ExportBundleEntry;
 	SerializationContext.IoStoreReader = Reader.Get();
 
-	FSavedPackageInfo& SavedPackageInfo = SavedPackageMap.FindOrAdd( SerializationContext.BundleData->PackageName );
-	SavedPackageInfo.ExportBundleChunks.Add( SerializationContext.BundleData->PackageChunkId );
+	FSavedPackageInfo& SavedPackageInfo = SavedPackageMap.FindOrAdd(SerializationContext.BundleData->PackageName);
+	SavedPackageInfo.ExportBundleChunks.Add(SerializationContext.BundleData->PackageChunkId);
 
 	// Populate package summary, and also process imports and exports
-	ProcessPackageSummaryAndNamesAndExportsAndImports( SerializationContext );
+	ProcessPackageSummaryAndNamesAndExportsAndImports(SerializationContext, PackageMap->GetDefaultZenPackageVersion());
 
 	// Serialize exports into the separate file (event driven loader expects that)
 	{
-		FString ExtensionString = LexToString( EPackageExtension::Exports );
-		
-		// Optional segment packages have .o prefix before their extensions, e.g.
-		if ( bIsOptionalSegmentPackage )
-		{
-			ExtensionString.InsertAt( 0, TEXT(".o") );
-		}
-		const FString ExportsFilename = FPaths::ChangeExtension( SerializationContext.PackageHeaderFilename, ExtensionString );
+		FString ExtensionString = LexToString(EPackageExtension::Exports);
 
-		const TUniquePtr<FArchive> ExportsArchive( IFileManager::Get().CreateFileWriter( *ExportsFilename, FILEWRITE_EvenIfReadOnly ) );
-		checkf( ExportsArchive.IsValid(), TEXT("Failed to load exports file '%s'"), *ExportsFilename );
-	
+		// Optional segment packages have .o prefix before their extensions, e.g.
+		if (PackageInfo.bIsOptional)
+		{
+			ExtensionString.InsertAt(0, TEXT(".o"));
+		}
+		const FString ExportsFilename = FPaths::ChangeExtension(SerializationContext.PackageHeaderFilename, ExtensionString);
+
+		const TUniquePtr<FArchive> ExportsArchive(IFileManager::Get().CreateFileWriter(*ExportsFilename, FILEWRITE_EvenIfReadOnly));
+		checkf(ExportsArchive.IsValid(), TEXT("Failed to load exports file '%s'"), *ExportsFilename);
+
 		// Write the exports. This will also fix-up serial offsets on the export map entries in the summary
-		WritePackageExports( *ExportsArchive, SerializationContext );
+		WritePackageExports(*ExportsArchive, SerializationContext);
 		ExportsArchive->Flush();
 	}
 
 	// Serialize package summary and other necessary data into the main asset header file
 	{
-		const EPackageExtension HeaderExtension = ( SerializationContext.Summary.GetPackageFlags() & PKG_ContainsMap ) != 0 ? EPackageExtension::Map : EPackageExtension::Asset;
-		FString ExtensionString = LexToString( HeaderExtension );
+		const EPackageExtension HeaderExtension = (SerializationContext.Summary.GetPackageFlags() & PKG_ContainsMap) != 0 ? EPackageExtension::Map : EPackageExtension::Asset;
+		FString ExtensionString = LexToString(HeaderExtension);
 
 		// Optional segment packages have .o prefix before their extensions, e.g.
-		if ( bIsOptionalSegmentPackage )
+		if (PackageInfo.bIsOptional)
 		{
-			ExtensionString.InsertAt( 0, TEXT(".o") );
+			ExtensionString.InsertAt(0, TEXT(".o"));
 		}
-		const FString HeaderFilename = FPaths::ChangeExtension( SerializationContext.PackageHeaderFilename, ExtensionString );
+		const FString HeaderFilename = FPaths::ChangeExtension(SerializationContext.PackageHeaderFilename, ExtensionString);
+
+		FString RelativeFilename = FPaths::SetExtension(ExportBundleEntry.PackageFilename, ExtensionString);
+		ChunkIdToSavedFileMap.Add(SerializationContext.BundleData->PackageChunkId, RelativeFilename);
+
+		const TUniquePtr<FArchive> HeaderArchive(IFileManager::Get().CreateFileWriter(*HeaderFilename, FILEWRITE_EvenIfReadOnly));
+		checkf(HeaderArchive.IsValid(), TEXT("Failed to open header file '%s'"), *HeaderFilename);
+
+		FAssetSerializationWriter ProxyWriter(*HeaderArchive, &SerializationContext);
 		
-		FString RelativeFilename = FPaths::SetExtension( ExportBundleEntry.PackageFilename, ExtensionString );
-		ChunkIdToSavedFileMap.Add( SerializationContext.BundleData->PackageChunkId, RelativeFilename );
-
-		const TUniquePtr<FArchive> HeaderArchive( IFileManager::Get().CreateFileWriter( *HeaderFilename, FILEWRITE_EvenIfReadOnly ) );
-		checkf( HeaderArchive.IsValid(), TEXT("Failed to open header file '%s'"), *HeaderFilename );
-
-		FAssetSerializationWriter ProxyWriter( *HeaderArchive, &SerializationContext );
-		WritePackageHeader( ProxyWriter, SerializationContext );
+		WritePackageHeader(ProxyWriter, SerializationContext, PackageMap->GetDefaultZenPackageVersion());
 		HeaderArchive->Flush();
 	}
 
 	// Write bulk data
-	WriteBulkData( SerializationContext );
+	WriteBulkData(SerializationContext);
 
 	// Notify the user that we have finished writing the asset
-	UE_LOG( LogIoStoreTools, Display, TEXT("Serialized Package '%s' to '%s'"), *SerializationContext.BundleData->PackageName.ToString(), *SerializationContext.PackageHeaderFilename );
+	UE_LOG(LogIoStoreTools, Display, TEXT("Serialized Package '%s' to '%s'"), *SerializationContext.BundleData->PackageName.ToString(), *SerializationContext.PackageHeaderFilename);
 	NumPackagesWritten++;
 }
 
@@ -299,10 +351,8 @@ FPackageIndex FCookedAssetWriter::CreatePackageImport( FName PackageName, FAsset
 	if ( ImportedPackageIndex.IsNull() )
 	{
 		const int32 ImportIndex = Context.ImportMap.AddDefaulted();
-		FObjectImport& NewPackageImport = Context.ImportMap[ ImportIndex ];
-
+		FObjectImport& NewPackageImport = Context.ImportMap[ImportIndex];
 		const FTopLevelAssetPath ClassPath = UPackage::StaticClass()->GetClassPathName();
-
 		NewPackageImport.ClassPackage = ClassPath.GetPackageName();
 		NewPackageImport.ClassName = ClassPath.GetAssetName();
 		NewPackageImport.ObjectName = PackageName;
@@ -315,7 +365,11 @@ FPackageIndex FCookedAssetWriter::CreatePackageImport( FName PackageName, FAsset
 FPackageIndex FCookedAssetWriter::CreateScriptObjectImport(const FPackageObjectIndex& PackageObjectIndex, FAssetSerializationContext& Context) const
 {
 	FPackageMapScriptObjectEntry ScriptObjectEntry;
-	check( PackageMap->FindScriptObject( PackageObjectIndex, ScriptObjectEntry ) );
+	if (!PackageMap->FindScriptObject(PackageObjectIndex, ScriptObjectEntry))
+	{
+		const int32 ImportIndex = Context.ImportMap.AddDefaulted();
+		return FPackageIndex::FromImport(ImportIndex);
+	}
 		
 	// If the outer index is null, we are making a top level UPackage import
 	if ( ScriptObjectEntry.OuterIndex.IsNull() )
@@ -330,31 +384,35 @@ FPackageIndex FCookedAssetWriter::CreateScriptObjectImport(const FPackageObjectI
 	// We couldn't find it, need to create one
 	if ( ResultObjectIndex.IsNull() )
 	{
-		const int32 ImportIndex = Context.ImportMap.AddDefaulted();
-		FObjectImport& NewObjectImport = Context.ImportMap[ ImportIndex ];
-
 		// Guessing the ScriptObject Class is a bit difficult for non-top-level objects, as they can be UClass, UFunction, UEnum or UScriptStruct
 		// If this is the CDO though, we know that it's Class is the ScriptObject specified in the CDO index
 		if ( !ScriptObjectEntry.CDOClassIndex.IsNull() )
 		{
 			const FPackageIndex CDOClassPackageIndex = CreateScriptObjectImport( ScriptObjectEntry.CDOClassIndex, Context );
 
+			const int32 ImportIndex = Context.ImportMap.AddDefaulted();
+			FObjectImport& NewObjectImport = Context.ImportMap[ImportIndex];
 			const FTopLevelAssetPath ClassPath = ResolvePackagePath( CDOClassPackageIndex, Context ).GetAssetPath();
 			NewObjectImport.ClassName = ClassPath.GetAssetName();
 			NewObjectImport.ClassPackage = ClassPath.GetPackageName();
+			NewObjectImport.OuterIndex = OuterObjectIndex;
+			NewObjectImport.ObjectName = ScriptObjectEntry.ObjectName;
+
+			ResultObjectIndex = FPackageIndex::FromImport(ImportIndex);
 		}
 		// We know nothing about the object otherwise, can be a top level object, can be a default sub-object of some native object
 		else
 		{
+			const int32 ImportIndex = Context.ImportMap.AddDefaulted();
+			FObjectImport& NewObjectImport = Context.ImportMap[ImportIndex];
 			const FTopLevelAssetPath ClassPath = UObject::StaticClass()->GetClassPathName();
 			NewObjectImport.ClassName = ClassPath.GetAssetName();
 			NewObjectImport.ClassPackage = ClassPath.GetPackageName();
+			NewObjectImport.OuterIndex = OuterObjectIndex;
+			NewObjectImport.ObjectName = ScriptObjectEntry.ObjectName;
+
+			ResultObjectIndex = FPackageIndex::FromImport(ImportIndex);
 		}
-	
-		NewObjectImport.OuterIndex = OuterObjectIndex;
-		NewObjectImport.ObjectName = ScriptObjectEntry.ObjectName;
-	
-		ResultObjectIndex = FPackageIndex::FromImport( ImportIndex );
 	}
 	return ResultObjectIndex;
 }
@@ -381,11 +439,40 @@ FPackageIndex FCookedAssetWriter::CreateExternalPackageObjectReference(const FPu
 	{
 		// Resolve exported package bundle first
 		FPackageMapExportBundleEntry ImportedPackageBundle;
-		check( PackageMap->FindExportBundleData( PackageImport.GetPackageId(), ImportedPackageBundle ) );
+		if (!PackageMap->FindExportBundleData(PackageImport.GetPackageId(), ImportedPackageBundle))
+		{
+			const int32 ImportIndex = Context.ImportMap.AddDefaulted();
+			return FPackageIndex::FromImport(ImportIndex);
+		}
 		
 		// Find the index of the export with the specified hash
-		const int32 PackageExportIndex = FindPackageExportByHash( ImportedPackageBundle, PackageImport.GetExportHash() );
-		check( PackageExportIndex != INDEX_NONE );
+		int32 PackageExportIndex = FindPackageExportByHash( ImportedPackageBundle, PackageImport.GetExportHash() );
+		if (PackageExportIndex == INDEX_NONE)
+		{
+			bool bFoundExport = false;
+			FPackageInfo PackageInfo;
+			PackageMap->FindPackageInfo(PackageImport.GetPackageId(), PackageInfo);
+			for (const FPackageDataInfo& PackageData : PackageInfo.PackageData)
+			{
+				ImportedPackageBundle = PackageData.ExportBundleEntry;
+				if (ImportedPackageBundle.PackageName.IsNone())
+				{
+					continue;
+				}
+
+				PackageExportIndex = FindPackageExportByHash(ImportedPackageBundle, PackageImport.GetExportHash());
+				if (PackageExportIndex != INDEX_NONE)
+				{
+					bFoundExport = true;
+					break;
+				}
+			}
+			if (!bFoundExport)
+			{
+				const int32 ImportIndex = Context.ImportMap.AddDefaulted();
+				return FPackageIndex::FromImport(ImportIndex);
+			}
+		}
 
 		// Call the internal function that will recursively populate exports
 		return CreatePackageExportReference( &ImportedPackageBundle, PackageExportIndex, Context );
@@ -406,9 +493,15 @@ FPackageIndex FCookedAssetWriter::CreateExternalPackageReference(const FPackageI
 	{
 		// Resolve exported package bundle first
 		FPackageMapExportBundleEntry ImportedPackageBundle;
-		check( PackageMap->FindExportBundleData( PackageId, ImportedPackageBundle ) );
-
-		return CreatePackageImport( ImportedPackageBundle.PackageName, Context );
+		if (PackageMap->FindExportBundleData(PackageId, ImportedPackageBundle))
+		{
+			return CreatePackageImport(ImportedPackageBundle.PackageName, Context);
+		}
+		else
+		{
+			const int32 ImportIndex = Context.ImportMap.AddDefaulted();
+			return FPackageIndex::FromImport(ImportIndex);
+		}
 	}
 
 	// Reference to the current package itself
@@ -467,13 +560,12 @@ FPackageIndex FCookedAssetWriter::CreatePackageExportReference( const FPackageMa
 		// Need to create it if it does not already exist
 		if ( ResultIndex.IsNull() )
 		{
-			const int32 ImportIndex = Context.ImportMap.AddDefaulted();
-			FObjectImport& NewObjectImport = Context.ImportMap[ ImportIndex ];
-
 			// The class name might be one of our exports in case of circular dependencies (which is the point),
 			// so we need to postpone class name fixup for this import until we have written our exports
 			const FPackageIndex ExportClassIndex = ResolvePackageLocalRef( ExternalPackageData, ExportData.ClassIndex, Context );
-		
+
+			const int32 ImportIndex = Context.ImportMap.AddDefaulted();
+			FObjectImport& NewObjectImport = Context.ImportMap[ImportIndex];
 			Context.ImportClassPathFixup.Add( ImportIndex, ExportClassIndex );
 			NewObjectImport.OuterIndex = OuterIndex;
 			NewObjectImport.ObjectName = ExportData.ObjectName;
@@ -575,40 +667,40 @@ FExportBundleEntry FCookedAssetWriter::BuildPreloadDependenciesFromExportBundle(
 	{
 		Context.ProcessedExportBundles.Add( ExportBundleIndex );
 		const FExportBundleEntry& FirstExportInBundle = ExportBundle[ 0 ];
-    	FExportPreloadDependencyList& FirstPreloadDependency = Context.PreloadDependencies[ FirstExportInBundle.LocalExportIndex ];
-    
-    	// Add internal dependencies to the first export in the bundle
-    	for ( const FPackageMapInternalDependencyArc& InternalDependency : Context.BundleData->InternalArcs )
-    	{
-    		if ( InternalDependency.ToExportBundleIndex == ExportBundleIndex )
-    		{
-    			const FExportBundleEntry LastExportInBundle = BuildPreloadDependenciesFromExportBundle( InternalDependency.FromExportBundleIndex, Context );
-    			const FPackageIndex ExportIndex = FPackageIndex::FromExport( LastExportInBundle.LocalExportIndex );
-    			
-    			FirstPreloadDependency.AddDependency( FirstExportInBundle.CommandType, ExportIndex, LastExportInBundle.CommandType );
-    		}
-    	}
-    	
-    	// Add external dependencies to the first export in the bundle
-    	for ( const FPackageMapExternalDependencyArc& ExternalDependency : Context.BundleData->ExternalArcs )
-    	{
-    		if ( ExternalDependency.ToExportBundleIndex == ExportBundleIndex )
-    		{
-    			const FPackageIndex ImportIndex = FPackageIndex::FromImport( ExternalDependency.FromImportIndex );
-    			FirstPreloadDependency.AddDependency( FirstExportInBundle.CommandType, ImportIndex, ExternalDependency.FromCommandType );
-    		}
-    	}
-    
-    	// Go over the exports in the bundle in their order and add dependency on the previous one for each export
-    	for ( int32 i = 1; i < ExportBundle.Num(); i++ )
-    	{
-    		const FExportBundleEntry& PreviousExportInBundle = ExportBundle[ i - 1 ];
-    		const FExportBundleEntry& CurrentExport = ExportBundle[ i ];
-    
-    		const FPackageIndex& ExportIndex = FPackageIndex::FromExport( PreviousExportInBundle.LocalExportIndex );
-    		FExportPreloadDependencyList& CurrentPreloadDependency = Context.PreloadDependencies[ CurrentExport.LocalExportIndex ];
-    		CurrentPreloadDependency.AddDependency( CurrentExport.CommandType, ExportIndex, PreviousExportInBundle.CommandType );
-    	}
+		FExportPreloadDependencyList& FirstPreloadDependency = Context.PreloadDependencies[ FirstExportInBundle.LocalExportIndex ];
+	
+		// Add internal dependencies to the first export in the bundle
+		for ( const FPackageMapInternalDependencyArc& InternalDependency : Context.BundleData->InternalArcs )
+		{
+			if ( InternalDependency.ToExportBundleIndex == ExportBundleIndex )
+			{
+				const FExportBundleEntry LastExportInBundle = BuildPreloadDependenciesFromExportBundle( InternalDependency.FromExportBundleIndex, Context );
+				const FPackageIndex ExportIndex = FPackageIndex::FromExport( LastExportInBundle.LocalExportIndex );
+				
+				FirstPreloadDependency.AddDependency( FirstExportInBundle.CommandType, ExportIndex, LastExportInBundle.CommandType );
+			}
+		}
+		
+		// Add external dependencies to the first export in the bundle
+		for ( const FPackageMapExternalDependencyArc& ExternalDependency : Context.BundleData->ExternalArcs )
+		{
+			if ( ExternalDependency.ToExportBundleIndex == ExportBundleIndex )
+			{
+				const FPackageIndex ImportIndex = FPackageIndex::FromImport( ExternalDependency.FromImportIndex );
+				FirstPreloadDependency.AddDependency( FirstExportInBundle.CommandType, ImportIndex, ExternalDependency.FromCommandType );
+			}
+		}
+	
+		// Go over the exports in the bundle in their order and add dependency on the previous one for each export
+		for ( int32 i = 1; i < ExportBundle.Num(); i++ )
+		{
+			const FExportBundleEntry& PreviousExportInBundle = ExportBundle[ i - 1 ];
+			const FExportBundleEntry& CurrentExport = ExportBundle[ i ];
+	
+			const FPackageIndex& ExportIndex = FPackageIndex::FromExport( PreviousExportInBundle.LocalExportIndex );
+			FExportPreloadDependencyList& CurrentPreloadDependency = Context.PreloadDependencies[ CurrentExport.LocalExportIndex ];
+			CurrentPreloadDependency.AddDependency( CurrentExport.CommandType, ExportIndex, PreviousExportInBundle.CommandType );
+		}
 	}
 
 	// Return the last export in the export bundle on which the dependent bundles can depend
@@ -757,7 +849,7 @@ FPackageIndex FCookedAssetWriter::CreateObjectExport( const FPackageMapExportEnt
 	return FPackageIndex::FromExport( NewExportIndex );
 }
 
-void FCookedAssetWriter::ProcessPackageSummaryAndNamesAndExportsAndImports( FAssetSerializationContext& Context ) const
+void FCookedAssetWriter::ProcessPackageSummaryAndNamesAndExportsAndImports( FAssetSerializationContext& Context, const EZenPackageVersion ZenPackageVersion ) const
 {
 	FPackageFileSummary& Summary = Context.Summary;
 
@@ -770,12 +862,27 @@ void FCookedAssetWriter::ProcessPackageSummaryAndNamesAndExportsAndImports( FAss
 	// Setup the versioning info if we have any in this package
 	if ( const FZenPackageVersioningInfo* VersionInfo = Context.BundleData->VersioningInfo.GetPtrOrNull() )
 	{
-		Summary.SetFileVersions( VersionInfo->PackageVersion.FileVersionUE4, VersionInfo->PackageVersion.FileVersionUE5, VersionInfo->LicenseeVersion );
+		// forcing UE5 version for correct summary serialization
+		if (ZenPackageVersion < EZenPackageVersion::DataResourceTable && VersionInfo->PackageVersion.FileVersionUE5 > (int32)EUnrealEngineObjectUE5Version::ADD_SOFTOBJECTPATH_LIST)
+		{
+			Summary.SetFileVersions(VersionInfo->PackageVersion.FileVersionUE4, (int32)EUnrealEngineObjectUE5Version::ADD_SOFTOBJECTPATH_LIST, VersionInfo->LicenseeVersion);
+		}
+		else
+		{
+			Summary.SetFileVersions(VersionInfo->PackageVersion.FileVersionUE4, VersionInfo->PackageVersion.FileVersionUE5, VersionInfo->LicenseeVersion);
+		}
 	}
 	else
 	{
 		// Otherwise mark ourselves as unversioned
-		Summary.SetToLatestFileVersions( true );
+		if (ZenPackageVersion < EZenPackageVersion::DataResourceTable)
+		{
+			Summary.SetFileVersions((int32)EUnrealEngineObjectUE4Version::VER_UE4_AUTOMATIC_VERSION, (int32)EUnrealEngineObjectUE5Version::ADD_SOFTOBJECTPATH_LIST, GPackageFileLicenseeUEVersion, true);
+		}
+		else
+		{
+			Summary.SetToLatestFileVersions(true);
+		}
 	}
 
 	// Clone name map into the Context
@@ -847,7 +954,7 @@ void FCookedAssetWriter::ProcessPackageSummaryAndNamesAndExportsAndImports( FAss
 	BuildPreloadDependenciesFromArcs( Context );
 }
 
-void FCookedAssetWriter::WritePackageHeader(FArchive& Ar, FAssetSerializationContext& Context)
+void FCookedAssetWriter::WritePackageHeader(FArchive& Ar, FAssetSerializationContext& Context, const EZenPackageVersion ZenPackageVersion)
 {
 	check( Context.Summary.GetPackageFlags() & PKG_FilterEditorOnly );
 	
@@ -891,7 +998,9 @@ void FCookedAssetWriter::WritePackageHeader(FArchive& Ar, FAssetSerializationCon
 	// We cannot add new names to the map after this point
 	Context.bNameMapWrittenToFile = true;
 
-	// Soft Object Paths are not present in the cooked assets
+	// Soft Object Paths are not present in the cooked assets, but offset isn't 0
+	Context.Summary.SoftObjectPathsCount = 0;
+	Context.Summary.SoftObjectPathsOffset = (int32)Ar.Tell();
 	// GatherableText are not present in the cooked assets
 
 	// Save Import Map
@@ -983,6 +1092,7 @@ void FCookedAssetWriter::WritePackageHeader(FArchive& Ar, FAssetSerializationCon
 	}
 
 	// Write object data resources
+	if (ZenPackageVersion >= EZenPackageVersion::DataResourceTable)
 	{
 		Context.Summary.DataResourceOffset = (int32) Ar.Tell();
 
@@ -1066,21 +1176,25 @@ void FCookedAssetWriter::WriteBulkData( const FAssetSerializationContext& Contex
 {
 	FSavedPackageInfo& SavedPackageInfo = SavedPackageMap.FindOrAdd( Context.BundleData->PackageName );
 	
-	for ( const FIoChunkId& BulkDataChunkId : Context.BundleData->BulkDataChunkIds )
+	FPackageInfo PackageInfo;
+	if (PackageMap->FindPackageInfo(Context.PackageId, PackageInfo))
 	{
-		TIoStatusOr<FIoBuffer> BulkDataBuffer = Context.IoStoreReader->Read( BulkDataChunkId, FIoReadOptions() );
-		check( BulkDataBuffer.IsOk() );
+		for (const FPackageBulkInfo& BulkData : PackageInfo.BulkData)
+		{
+			TIoStatusOr<FIoBuffer> BulkDataBuffer = BulkData.Reader->Read(BulkData.BulkDataChunkIds, FIoReadOptions());
+			check(BulkDataBuffer.IsOk());
 
-		TIoStatusOr<FIoStoreTocChunkInfo> ChunkInfo = Context.IoStoreReader->GetChunkInfo( BulkDataChunkId );
-		check( ChunkInfo.IsOk() );
+			TIoStatusOr<FIoStoreTocChunkInfo> ChunkInfo = BulkData.Reader->GetChunkInfo(BulkData.BulkDataChunkIds);
+			check(ChunkInfo.IsOk());
 
-		FString RelativeFilename = ChunkInfo.ValueOrDie().FileName;
-		RelativeFilename.RemoveFromStart( TEXT("../../../") );
+			FString RelativeFilename = ChunkInfo.ValueOrDie().FileName;
+			RelativeFilename.RemoveFromStart(TEXT("../../../"));
 
-		const FString ResultFilename = FPaths::Combine( RootOutputDir, RelativeFilename );
-		FFileHelper::SaveArrayToFile( TArrayView<const uint8>( BulkDataBuffer.ValueOrDie().Data(), BulkDataBuffer.ValueOrDie().DataSize() ), *ResultFilename );
+			const FString ResultFilename = FPaths::Combine(RootOutputDir, RelativeFilename);
+			FFileHelper::SaveArrayToFile(TArrayView64<const uint8>(BulkDataBuffer.ValueOrDie().Data(), BulkDataBuffer.ValueOrDie().DataSize()), *ResultFilename);
 
-		ChunkIdToSavedFileMap.Add( BulkDataChunkId, RelativeFilename );
-		SavedPackageInfo.BulkDataChunks.Add( BulkDataChunkId );
+			ChunkIdToSavedFileMap.Add(BulkData.BulkDataChunkIds, RelativeFilename);
+			SavedPackageInfo.BulkDataChunks.Add(BulkData.BulkDataChunkIds);
+		}
 	}
 }

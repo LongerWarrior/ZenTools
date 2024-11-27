@@ -1,4 +1,4 @@
-﻿// Copyright Nikita Zolotukhin. All Rights Reserved.
+// Copyright Nikita Zolotukhin. All Rights Reserved.
 
 #include "IoStorePackageMap.h"
 #include "Serialization/LargeMemoryReader.h"
@@ -8,6 +8,42 @@
 void FIoStorePackageMap::SetDefaultZenPackageVersion(EZenPackageVersion NewDefaultPackageVersion)
 {
 	DefaultZenPackageVersion = NewDefaultPackageVersion;
+}
+
+EZenPackageVersion FIoStorePackageMap::GetDefaultZenPackageVersion() const
+{
+	return DefaultZenPackageVersion;
+}
+
+void FIoStorePackageMap::PopulateBulkData(const TSharedPtr<FIoStoreReader>& Reader)
+{
+	const TArray BulkDataChunkTypes{ EIoChunkType::BulkData, EIoChunkType::MemoryMappedBulkData, EIoChunkType::OptionalBulkData };
+
+	for (TPair<FPackageId, FPackageInfo>& Package : PackageMap)
+	{
+		const FPackageId& PackageId = Package.Key;
+		if (Package.Value.bIsOptional)
+		{
+			// Optional segment packages can only have optional segment bulk data
+			const FIoChunkId BulkDataChunkId = CreateIoChunkId(PackageId.Value(), 1, EIoChunkType::BulkData);
+			if (Reader->GetChunkInfo(BulkDataChunkId).IsOk())
+			{
+				Package.Value.BulkData.Add(FPackageBulkInfo(Reader, BulkDataChunkId));
+			}
+		}
+		else
+		{
+			//// Required segment packages can have bulk data, memory mapped bulk data and optional bulk data
+			for (const EIoChunkType BulkDataChunkType : BulkDataChunkTypes)
+			{
+				const FIoChunkId BulkDataChunkId = CreateIoChunkId(PackageId.Value(), 0, BulkDataChunkType);
+				if (Reader->GetChunkInfo(BulkDataChunkId).IsOk())
+				{
+					Package.Value.BulkData.Add(FPackageBulkInfo(Reader, BulkDataChunkId));
+				}
+			}
+		}
+	}
 }
 
 void FIoStorePackageMap::PopulateFromContainer(const TSharedPtr<FIoStoreReader>& Reader)
@@ -37,8 +73,12 @@ void FIoStorePackageMap::PopulateFromContainer(const TSharedPtr<FIoStoreReader>&
 		for (FFilePackageStoreEntry& ContainerEntry : StoreEntries)
 		{
 			const FPackageId& PackageId = ContainerHeader.PackageIds[PackageIndex++];
-			FPackageHeaderData& PackageHeader = PackageHeaders.FindOrAdd(PackageId);
-			
+
+			FPackageInfo& PackageInfo = PackageMap.FindOrAdd(PackageId);
+			PackageInfo.PackageData.Insert(FPackageDataInfo(Reader), 0);
+			FPackageDataInfo& PackageDataInfo = PackageInfo.PackageData[0];
+			FPackageHeaderData& PackageHeader = PackageDataInfo.PackageHeader;
+
 			PackageHeader.ImportedPackages = TArrayView<FPackageId>(ContainerEntry.ImportedPackages.Data(), ContainerEntry.ImportedPackages.Num());
 			PackageHeader.ShaderMapHashes = TArrayView<FSHAHash>(ContainerEntry.ShaderMapHashes.Data(), ContainerEntry.ShaderMapHashes.Num());
 			PackageHeader.ExportCount = ContainerEntry.ExportCount;
@@ -51,7 +91,12 @@ void FIoStorePackageMap::PopulateFromContainer(const TSharedPtr<FIoStoreReader>&
 		for (FFilePackageStoreEntry& ContainerEntry : OptionalStoreEntries)
 		{
 			const FPackageId& PackageId = ContainerHeader.OptionalSegmentPackageIds[OptionalPackageIndex++];
-			FPackageHeaderData& PackageHeader = PackageHeaders.FindOrAdd(PackageId);
+
+			FPackageInfo& PackageInfo = PackageMap.FindOrAdd(PackageId);
+			PackageInfo.bIsOptional = true;
+			PackageInfo.PackageData.Insert(FPackageDataInfo(Reader), 0);
+			FPackageDataInfo& PackageDataInfo = PackageInfo.PackageData[0];
+			FPackageHeaderData& PackageHeader = PackageDataInfo.PackageHeader;
 			
 			PackageHeader.ImportedPackages = TArrayView<FPackageId>(ContainerEntry.ImportedPackages.Data(), ContainerEntry.ImportedPackages.Num());
 			PackageHeader.ShaderMapHashes = TArrayView<FSHAHash>(ContainerEntry.ShaderMapHashes.Data(), ContainerEntry.ShaderMapHashes.Num());
@@ -62,6 +107,7 @@ void FIoStorePackageMap::PopulateFromContainer(const TSharedPtr<FIoStoreReader>&
 		}
 	}
 
+	TArray<FPackageId> PackageIdsToRemove;
 	// Iterate package chunks from the header
 	for ( const FPackageId& PackageId : PackageIdsInThisContainer )
 	{
@@ -70,22 +116,19 @@ void FIoStorePackageMap::PopulateFromContainer(const TSharedPtr<FIoStoreReader>&
 		
 		TIoStatusOr<FIoStoreTocChunkInfo> ChunkInfo = Reader->GetChunkInfo( ChunkId );
 		TIoStatusOr<FIoBuffer> PackageBuffer = Reader->Read( ChunkId, FIoReadOptions() );
-		checkf( PackageBuffer.IsOk(), TEXT("Failed to find ChunkId %s for PackageId 0x%llx in ContainerId 0x%llx (ChunkInfo valid: %d)"),
-			*LexToString( ChunkId ), PackageId.ValueForDebugging(), Reader->GetContainerId().Value(), ChunkInfo.IsOk() );
+		if (!PackageBuffer.IsOk())
+		{
+			// should only happens for patch containers
+			PackageIdsToRemove.Add(PackageId);
+			continue;
+		}
 
 		FPackageMapExportBundleEntry* ExportBundleEntry = ReadExportBundleData( PackageId, ChunkInfo.ValueOrDie(), PackageBuffer.ValueOrDie() );
+	}
 
-		// Required segment packages can have bulk data, memory mapped bulk data and optional bulk data
-		const TArray BulkDataChunkTypes{ EIoChunkType::BulkData, EIoChunkType::MemoryMappedBulkData, EIoChunkType::OptionalBulkData };
-
-		for ( const EIoChunkType BulkDataChunkType : BulkDataChunkTypes )
-		{
-			const FIoChunkId BulkDataChunkId = CreateIoChunkId( PackageId.Value(), 0, BulkDataChunkType );
-			if ( Reader->GetChunkInfo( BulkDataChunkId ).IsOk() )
-			{
-				ExportBundleEntry->BulkDataChunkIds.Add( BulkDataChunkId );
-			}
-		}
+	for (const FPackageId& PackageId : PackageIdsToRemove)
+	{
+		PackageIdsInThisContainer.Remove(PackageId);
 	}
 
 	// Iterate optional packages from the header
@@ -99,13 +142,6 @@ void FIoStorePackageMap::PopulateFromContainer(const TSharedPtr<FIoStoreReader>&
 		check( PackageBuffer.IsOk() );
 		
 		FPackageMapExportBundleEntry* ExportBundleEntry = ReadExportBundleData( PackageId, ChunkInfo.ValueOrDie(), PackageBuffer.ValueOrDie() );
-
-		// Optional segment packages can only have optional segment bulk data
-		const FIoChunkId BulkDataChunkId = CreateIoChunkId( PackageId.Value(), 1, EIoChunkType::BulkData );
-		if ( Reader->GetChunkInfo( BulkDataChunkId ).IsOk() )
-		{
-			ExportBundleEntry->BulkDataChunkIds.Add( BulkDataChunkId );
-		}
 	}
 
 	FPackageContainerMetadata& Metadata = ContainerMetadata.FindOrAdd( Reader->GetContainerId() );
@@ -126,9 +162,10 @@ bool FIoStorePackageMap::FindPackageContainerMetadata(FIoContainerId ContainerId
 
 bool FIoStorePackageMap::FindPackageHeader(const FPackageId& PackageId, FPackageHeaderData& OutPackageHeader) const
 {
-	if ( const FPackageHeaderData* HeaderData = PackageHeaders.Find( PackageId ) )
+	if ( const FPackageInfo* PackageInfo = PackageMap.Find( PackageId ) )
 	{
-		OutPackageHeader = *HeaderData;
+		check( !PackageInfo->PackageData.IsEmpty() );
+		OutPackageHeader = PackageInfo->PackageData[0].PackageHeader;
 		return true;
 	}
 	return false;
@@ -136,9 +173,10 @@ bool FIoStorePackageMap::FindPackageHeader(const FPackageId& PackageId, FPackage
 
 FName FIoStorePackageMap::FindPackageName(const FPackageId& PackageId) const
 {
-	if ( const FPackageMapExportBundleEntry* Entry = PackageMap.Find( PackageId ) )
+	if ( const FPackageInfo* PackageInfo = PackageMap.Find( PackageId ) )
 	{
-		return Entry->PackageName;
+		check(!PackageInfo->PackageData.IsEmpty() );
+		return PackageInfo->PackageData[0].ExportBundleEntry.PackageName;
 	}
 	return NAME_None;
 }
@@ -156,9 +194,46 @@ bool FIoStorePackageMap::FindScriptObject(const FPackageObjectIndex& Index, FPac
 
 bool FIoStorePackageMap::FindExportBundleData(const FPackageId& PackageId, FPackageMapExportBundleEntry& OutExportBundleEntry) const
 {
-	if ( const FPackageMapExportBundleEntry* Bundle = PackageMap.Find( PackageId ) )
+	if (const FPackageInfo* PackageInfo = PackageMap.Find(PackageId))
 	{
-		OutExportBundleEntry = *Bundle;
+		check(!PackageInfo->PackageData.IsEmpty() );
+		// need to find first not null entry
+		for (const FPackageDataInfo& PackageData : PackageInfo->PackageData)
+		{
+			if (!PackageData.ExportBundleEntry.PackageName.IsNone())
+			{
+				OutExportBundleEntry = PackageData.ExportBundleEntry;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool FIoStorePackageMap::FindExportBundleDataAndReader(const FPackageId& PackageId, FPackageMapExportBundleEntry& OutExportBundleEntry, TSharedPtr<FIoStoreReader>& OutReader) const
+{
+	if (const FPackageInfo* PackageInfo = PackageMap.Find(PackageId))
+	{
+		check(!PackageInfo->PackageData.IsEmpty());
+		// need to find first not null entry
+		for (const FPackageDataInfo& PackageData : PackageInfo->PackageData)
+		{
+			if (!PackageData.ExportBundleEntry.PackageName.IsNone())
+			{
+				OutExportBundleEntry = PackageData.ExportBundleEntry;
+				OutReader = PackageData.Reader;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool FIoStorePackageMap::FindPackageInfo(const FPackageId& PackageId, FPackageInfo& OutPackageInfo) const
+{
+	if (const FPackageInfo* PackageInfo = PackageMap.Find(PackageId))
+	{
+		OutPackageInfo = *PackageInfo;
 		return true;
 	}
 	return false;
@@ -260,10 +335,12 @@ FPackageMapExportBundleEntry* FIoStorePackageMap::ReadExportBundleData( const FP
 	const FName PackageName = PackageSummary->Name.ResolveName(PackageNameMap);
 
 	// Find package header to resolve imported package IDs
-	const FPackageHeaderData& PackageHeader = PackageHeaders.FindChecked( PackageId );
+	FPackageInfo& PackageInfo = PackageMap.FindChecked( PackageId );
+	check( !PackageInfo.PackageData.IsEmpty() );
+	const FPackageHeaderData& PackageHeader = PackageInfo.PackageData[0].PackageHeader;
 	
 	// Construct package data
-	FPackageMapExportBundleEntry& PackageData = PackageMap.FindOrAdd( PackageId );
+	FPackageMapExportBundleEntry& PackageData = PackageInfo.PackageData[0].ExportBundleEntry;
 	PackageData.PackageFilename = ChunkInfo.FileName;
 	PackageData.PackageName = PackageName;
 	PackageData.PackageFlags = PackageSummary->PackageFlags;
@@ -275,7 +352,9 @@ FPackageMapExportBundleEntry* FIoStorePackageMap::ReadExportBundleData( const FP
 	PackageData.PackageFilename.RemoveFromStart( TEXT("../../../") );
 
 	// Save name map
-	PackageData.NameMap.AddZeroed( PackageNameMap.Num() );
+	PackageData.NameMap.Empty(PackageNameMap.Num());
+	PackageData.NameMap.AddZeroed(PackageNameMap.Num());
+
 	for ( int32 i = 0; i < PackageNameMap.Num(); i++ )
 	{
 		PackageData.NameMap[i] = PackageNameMap[ i ].ToName( NAME_NO_NUMBER_INTERNAL );

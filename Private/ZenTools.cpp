@@ -34,7 +34,8 @@ INT32_MAIN_INT32_ARGC_TCHAR_ARGV()
 	return Result;
 }
 
-bool FIOStoreTools::ExtractPackagesFromContainers( const FString& ContainerDirPath, const FString& OutputDirPath, const FString& EncryptionKeysFile, EZenPackageVersion DefaultZenPackageVersion, const FString& PackageFilter )
+bool FIOStoreTools::ExtractPackagesFromContainers( const FString& ContainerDirPath, const FString& OutputDirPath, const FString& EncryptionKeysFile,
+	EZenPackageVersion DefaultZenPackageVersion, const FString& PackageFilter, const FString& Filter, bool SkipBulkData )
 {
 	TMap<FGuid, FAES::FAESKey> EncryptionKeys;
 	if ( !EncryptionKeysFile.IsEmpty() )
@@ -84,6 +85,23 @@ bool FIOStoreTools::ExtractPackagesFromContainers( const FString& ContainerDirPa
 		}
 	}
 	
+	TArray<FString> FilterStrings;
+	if (!Filter.IsEmpty())
+	{
+		if (!IFileManager::Get().FileExists(*Filter))
+		{
+			UE_LOG(LogIoStoreTools, Display, TEXT("Filter file '%s' does not exist."), *Filter);
+			return false;
+		}
+
+		if (!FFileHelper::LoadFileToStringArray(FilterStrings, *Filter))
+		{
+			UE_LOG(LogIoStoreTools, Display, TEXT("Failed to read filter file '%s'."), *Filter);
+			return false;
+		}
+	}
+	FilterStrings.Add(PackageFilter);
+
 	TArray<FString> ContainerTableOfContentsFiles;
 	IFileManager::Get().FindFiles( ContainerTableOfContentsFiles, *ContainerDirPath, TEXT(".utoc") );
 
@@ -93,20 +111,26 @@ bool FIOStoreTools::ExtractPackagesFromContainers( const FString& ContainerDirPa
 		return false;
 	}
 
-	TArray<TSharedPtr<FIoStoreReader>> ContainerReaders;
+	TMap<TSharedPtr<FIoStoreReader>, FReadOrder> ContainerReaders;
 	for ( const FString& ContainerFilename : ContainerTableOfContentsFiles )
 	{
 		const TSharedPtr<FIoStoreReader> IoStoreReader = MakeShared<FIoStoreReader>();
 		const FString FullFilePath = FPaths::Combine( ContainerDirPath, ContainerFilename );
 		
-		const FIoStatus OpenStatus = IoStoreReader->Initialize(  *FPaths::ChangeExtension( FullFilePath, TEXT("") ), EncryptionKeys );
+		const FIoStatus OpenStatus = IoStoreReader->Initialize( *FPaths::ChangeExtension( FullFilePath, TEXT("") ), EncryptionKeys );
 		if ( !OpenStatus.IsOk() )
 		{
 			UE_LOG( LogIoStoreTools, Error, TEXT("Failed to open Container file '%s': %s"), *FullFilePath, *OpenStatus.ToString() );
 			return false;
 		}
-		ContainerReaders.Add( IoStoreReader );
+
+		ContainerReaders.Add(IoStoreReader, FReadOrder(FPaths::GetBaseFilename(ContainerFilename)));
 	}
+
+	ContainerReaders.ValueSort([](const FReadOrder& A, const FReadOrder& B) { 
+		int32 order = A.PakOrder - B.PakOrder;
+		return order != 0 ? order < 0 : A.Filename.Compare(B.Filename, ESearchCase::IgnoreCase) < 0; 
+	});
 
 	UE_LOG( LogIoStoreTools, Display, TEXT("Successfully opened %d Container files"), ContainerReaders.Num() );
 
@@ -114,24 +138,35 @@ bool FIOStoreTools::ExtractPackagesFromContainers( const FString& ContainerDirPa
 	const TSharedPtr<FIoStorePackageMap> PackageMap = MakeShared<FIoStorePackageMap>();
 	PackageMap->SetDefaultZenPackageVersion( DefaultZenPackageVersion );
 
-	for ( const TSharedPtr<FIoStoreReader>& Reader : ContainerReaders )
+	for (const TPair<TSharedPtr<FIoStoreReader>, FReadOrder>& Reader : ContainerReaders)
 	{
-		PackageMap->PopulateFromContainer( Reader );
+		PackageMap->PopulateFromContainer(Reader.Key);
 	}
+
+	if (!SkipBulkData)
+	{
+		for (const TPair<TSharedPtr<FIoStoreReader>, FReadOrder>& Reader : ContainerReaders)
+		{
+			PackageMap->PopulateBulkData(Reader.Key);
+		}
+	}
+
 	UE_LOG( LogIoStoreTools, Display, TEXT("Populated Package Map with %d Packages"), PackageMap->GetTotalPackageCount() );
 
 	UE_LOG( LogIoStoreTools, Display, TEXT("Begin writing Cooked Packages to '%s'"), *OutputDirPath );
-	const TSharedPtr<FCookedAssetWriter> PackageWriter = MakeShared<FCookedAssetWriter>( PackageMap, OutputDirPath );
+	const TSharedPtr<FCookedAssetWriter> PackageWriter = MakeShared<FCookedAssetWriter>( PackageMap, ContainerReaders, OutputDirPath );
 	
-	for ( const TSharedPtr<FIoStoreReader>& Reader : ContainerReaders )
+	for ( const TPair<TSharedPtr<FIoStoreReader>, FReadOrder>& Reader : ContainerReaders )
 	{
-		PackageWriter->WritePackagesFromContainer( Reader, PackageFilter );
-		PackageWriter->WriteGlobalScriptObjects( Reader );
+		PackageWriter->WriteGlobalScriptObjects(Reader.Key);
 	}
+
+	PackageWriter->WritePackages(FilterStrings);
 	
 	UE_LOG( LogIoStoreTools, Display, TEXT("Done writing %d packages."), PackageWriter->GetTotalNumPackagesWritten() );
 
 	PackageWriter->WritePackageStoreManifest();
+	PackageWriter->WriteResponseFiles();
 	return true;
 }
 
@@ -199,11 +234,23 @@ bool FIOStoreTools::ExecuteIOStoreTools(const TCHAR* Cmd)
 			DefaultZenPackageVersion = EZenPackageVersion::Initial;
 		}
 
+		bool SkipBulkData = false;
+		if (FParse::Param(Cmd, TEXT("SkipBulkData")))
+		{
+			SkipBulkData = true;
+		}
+
+		FString FilterFilePath;
+		if (FParse::Value(Cmd, TEXT("Filter="), FilterFilePath))
+		{
+			FilterFilePath = FPaths::ConvertRelativePathToFull(FilterFilePath);
+		}
+
 		// Maybe parse a package filter
 		FString PotentialPackageFilter;
 		FParse::Value( Cmd, TEXT("PackageFilter="), PotentialPackageFilter );
 
-		return ExtractPackagesFromContainers( ContainerFolderPath, ExtractFolderRootPath, EncryptionKeysFile, DefaultZenPackageVersion, PotentialPackageFilter );
+		return ExtractPackagesFromContainers( ContainerFolderPath, ExtractFolderRootPath, EncryptionKeysFile, DefaultZenPackageVersion, PotentialPackageFilter, FilterFilePath, SkipBulkData);
 	}
 
 	UE_LOG( LogIoStoreTools, Display, TEXT("Unknown command. Available commands: ") );

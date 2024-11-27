@@ -1,4 +1,4 @@
-﻿// Copyright Nikita Zolotukhin. All Rights Reserved.
+// Copyright Nikita Zolotukhin. All Rights Reserved.
 
 #pragma once
 
@@ -71,26 +71,69 @@ struct FSavedPackageInfo
 	TArray<FIoChunkId> BulkDataChunks;
 };
 
+struct FReadOrder
+{
+	FString Filename;
+	uint32 PakOrder;
+
+	FReadOrder(const FString& InFilename)
+	{
+		FString FullFilename = FPaths::GetBaseFilename(InFilename);
+		Filename = FullFilename;
+		PakOrder = 0;
+		if (Filename.EndsWith(TEXT("_P")))
+		{
+			uint32 ChunkVersionNumber = 1;
+			Filename = FullFilename.LeftChop(2);
+			int32 VersionEndIndex = FullFilename.Find("_", ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+			if (VersionEndIndex != INDEX_NONE && VersionEndIndex > 0)
+			{
+				int32 VersionStartIndex = FullFilename.Find("_", ESearchCase::CaseSensitive, ESearchDir::FromEnd, VersionEndIndex - 1);
+				if (VersionStartIndex != INDEX_NONE)
+				{
+					VersionStartIndex++;
+					FString VersionString = FullFilename.Mid(VersionStartIndex, VersionEndIndex - VersionStartIndex);
+					if (VersionString.IsNumeric())
+					{
+						Filename = FullFilename.Left(VersionStartIndex - 1);
+						int32 ChunkVersionSigned = FCString::Atoi(*VersionString);
+						if (ChunkVersionSigned >= 1)
+						{
+							ChunkVersionNumber = (uint32)ChunkVersionSigned + 1;
+						}
+					}
+				}
+			}
+			PakOrder = 100 * ChunkVersionNumber;
+		}
+	}
+};
+
 class ZENTOOLS_API FCookedAssetWriter
 {
 protected:
 	TSharedPtr<FIoStorePackageMap> PackageMap;
+	TMap<FString, TArray<FString>> SavedPackages;
+	TMap<TSharedPtr<FIoStoreReader>, FReadOrder> Readers;
 	FString RootOutputDir;
 	int32 NumPackagesWritten;
 	TMap<FIoChunkId, FString> ChunkIdToSavedFileMap;
 	TMap<FName, FSavedPackageInfo> SavedPackageMap;
 public:
-	FCookedAssetWriter( const TSharedPtr<FIoStorePackageMap>& InPackageMap, const FString& InOutputDir );
+	FCookedAssetWriter( const TSharedPtr<FIoStorePackageMap>& InPackageMap, const TMap<TSharedPtr<FIoStoreReader>, FReadOrder>& ContainerReaders,  const FString& InOutputDir );
 	
-	void WritePackagesFromContainer( const TSharedPtr<FIoStoreReader>& Reader, const FString& PackageFilter );
+	FString GetReaderName(const TSharedPtr<FIoStoreReader>& Reader) { return Readers.FindChecked(Reader).Filename; };
+	
+	void WritePackages(const TArray<FString>& FilterStrings);
 	void WriteGlobalScriptObjects( const TSharedPtr<FIoStoreReader>& Reader ) const;
 	void WritePackageStoreManifest() const;
+	void WriteResponseFiles() const;
 
 	FORCEINLINE int32 GetTotalNumPackagesWritten() const { return NumPackagesWritten; }
 private:
-	TFunction<bool(const FPackageId&)> MakePackageFilterFunction( const FString& PackageFilter ) const;
-	void WriteSinglePackage( FPackageId PackageId, bool bIsOptionalSegmentPackage, const TSharedPtr<FIoStoreReader>& Reader );
-	void ProcessPackageSummaryAndNamesAndExportsAndImports( FAssetSerializationContext& Context ) const;
+	TFunction<bool(const FPackageId&)> MakePackageFilterFunction(const TArray<FString>& FilterStrings) const;
+	void WriteSinglePackage( FPackageId PackageId, const FPackageInfo& PackageInfo);
+	void ProcessPackageSummaryAndNamesAndExportsAndImports( FAssetSerializationContext& Context, const EZenPackageVersion ZenPackageVersion) const;
 	static FExportBundleEntry BuildPreloadDependenciesFromExportBundle( int32 ExportBundleIndex, FAssetSerializationContext& Context );
 	static void BuildPreloadDependenciesFromArcs( FAssetSerializationContext& Context );
 	static void BuildPreloadDependenciesFromExports( FAssetSerializationContext& Context );
@@ -108,7 +151,7 @@ private:
 	static FSoftObjectPath ResolvePackagePath( FPackageIndex PackageIndex, FAssetSerializationContext& Context );
 	static FPackageIndex FindExistingObjectImport( FPackageIndex OuterIndex, FName ObjectName, FAssetSerializationContext& Context );
 
-	static void WritePackageHeader( FArchive& Ar, FAssetSerializationContext& Context );
+	static void WritePackageHeader( FArchive& Ar, FAssetSerializationContext& Context, const EZenPackageVersion ZenPackageVersion);
 	static void WritePackageExports( FArchive& Ar, FAssetSerializationContext& Context );
 	void WriteBulkData(const FAssetSerializationContext& Context );
 };

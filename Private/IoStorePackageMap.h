@@ -1,4 +1,4 @@
-﻿// Copyright Nikita Zolotukhin. All Rights Reserved.
+// Copyright Nikita Zolotukhin. All Rights Reserved.
 
 #pragma once
 
@@ -12,6 +12,7 @@ struct FPackageContainerMetadata
 {
 	TArray<FPackageId> PackagesInContainer;
 	TArray<FPackageId> OptionalPackagesInContainer;
+	FString ContainerFilename;
 };
 
 /** Data about the package header located in the Container Header, needed to parse the exports */
@@ -137,26 +138,60 @@ struct FPackageMapExportBundleEntry
 	TArray<FBulkDataMapEntry> BulkDataResourceTable;
 };
 
+struct FPackageDataInfo
+{
+	const TSharedPtr<FIoStoreReader>& Reader;
+	FPackageHeaderData PackageHeader;
+	FPackageMapExportBundleEntry ExportBundleEntry;
+
+	FPackageDataInfo(const TSharedPtr<FIoStoreReader>& Reader) : Reader(Reader), PackageHeader(), ExportBundleEntry() {}
+};
+
+
+struct FPackageBulkInfo
+{
+	const TSharedPtr<FIoStoreReader>& Reader;
+	FIoChunkId BulkDataChunkIds;
+
+	FPackageBulkInfo(const TSharedPtr<FIoStoreReader>& Reader, const FIoChunkId BulkDataChunkIds) : Reader(Reader), BulkDataChunkIds(BulkDataChunkIds) {}
+};
+
+struct FPackageInfo
+{
+	TArray<FPackageDataInfo> PackageData;
+	TArray<FPackageBulkInfo> BulkData;
+	bool bIsOptional{ false };
+};
+
+
 /** Package map is a central storage mapping package IDs (and overall any FPackageObjectIndex objects) to their names and locations */
 class ZENTOOLS_API FIoStorePackageMap
 {
 private:
-	TMap<FPackageId, FPackageHeaderData> PackageHeaders;
 	TMap<FPackageObjectIndex, FPackageMapScriptObjectEntry> ScriptObjectMap;
-	TMap<FPackageId, FPackageMapExportBundleEntry> PackageMap;
+	TMap<FPackageId, FPackageInfo> PackageMap;
+
 	TMap<FIoContainerId, FPackageContainerMetadata> ContainerMetadata;
 	EZenPackageVersion DefaultZenPackageVersion{EZenPackageVersion::Latest};
 public:
+	//functio nto get NewPackageMap
+	const TMap<FPackageId, FPackageInfo>& GetNewPackageMap() const { return PackageMap; }
+
 	void SetDefaultZenPackageVersion( EZenPackageVersion NewDefaultPackageVersion );
+	EZenPackageVersion GetDefaultZenPackageVersion() const;
 
 	/** Salvages the provided IoStore container for the exports and script objects and populates the map */
 	void PopulateFromContainer(const TSharedPtr<FIoStoreReader>& Reader);
+	void PopulateBulkData(const TSharedPtr<FIoStoreReader>& Reader);
 
 	/** Attempts to find a script object in the map, returns true and the info if it was found */
 	bool FindScriptObject( const FPackageObjectIndex& Index, FPackageMapScriptObjectEntry& OutMapEntry ) const;
 
 	/** Attempts to find the export bundle for the given package */
 	bool FindExportBundleData( const FPackageId& PackageId, FPackageMapExportBundleEntry& OutExportBundleEntry ) const;
+	bool FindExportBundleDataAndReader(const FPackageId& PackageId, FPackageMapExportBundleEntry& OutExportBundleEntry, TSharedPtr<FIoStoreReader>& OutReader) const;
+
+	bool FindPackageInfo( const FPackageId& PackageId, FPackageInfo& OutPackageInfo ) const;
 
 	bool FindPackageContainerMetadata( FIoContainerId ContainerId, FPackageContainerMetadata& OutMetadata ) const;
 
