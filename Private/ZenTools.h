@@ -12,6 +12,6 @@ class ZENTOOLS_API FIOStoreTools
 {
 public:
 	static bool ExecuteIOStoreTools( const TCHAR* Cmd );
-	static bool ExtractPackagesFromContainers( const FString& ContainerDirPath, const FString& OutputDirPath, const FString& EncryptionKeysFile, 
+	static bool ExtractPackagesFromContainers( const FString& ContainerDirPath, const FString& OutputDirPath, const FString& MainAesKey, const FString& EncryptionKeysFile,
 		EZenPackageVersion DefaultZenPackageVersion, const FString& PackageFiler, const FString& Filter, bool SkipBulkData );
 };

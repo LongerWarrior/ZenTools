@@ -34,7 +34,7 @@ INT32_MAIN_INT32_ARGC_TCHAR_ARGV()
 	return Result;
 }
 
-bool FIOStoreTools::ExtractPackagesFromContainers( const FString& ContainerDirPath, const FString& OutputDirPath, const FString& EncryptionKeysFile,
+bool FIOStoreTools::ExtractPackagesFromContainers( const FString& ContainerDirPath, const FString& OutputDirPath, const FString& MainAesKey, const FString& EncryptionKeysFile,
 	EZenPackageVersion DefaultZenPackageVersion, const FString& PackageFilter, const FString& Filter, bool SkipBulkData )
 {
 	TMap<FGuid, FAES::FAESKey> EncryptionKeys;
@@ -65,7 +65,11 @@ bool FIOStoreTools::ExtractPackagesFromContainers( const FString& ContainerDirPa
 			FGuid KeyGuid;
 			if ( FGuid::Parse( EntryPair.Key, KeyGuid ) )
 			{
-				const FString EncryptionKeyHex = EntryPair.Value->AsString();
+				FString EncryptionKeyHex = EntryPair.Value->AsString();
+				if (EncryptionKeyHex.StartsWith("0x"))
+				{
+					EncryptionKeyHex = EncryptionKeyHex.RightChop(2);
+				}
 
 				TArray<uint8> HexToBytesBuffer;
 				HexToBytesBuffer.AddZeroed( EncryptionKeyHex.Len() + 1 );
@@ -84,7 +88,22 @@ bool FIOStoreTools::ExtractPackagesFromContainers( const FString& ContainerDirPa
 			}
 		}
 	}
-	
+
+	if (!MainAesKey.IsEmpty())
+	{
+		TArray<uint8> HexToBytesBuffer;
+		HexToBytesBuffer.AddZeroed(MainAesKey.Len() + 1);
+		HexToBytesBuffer.SetNumZeroed(HexToBytes(MainAesKey, HexToBytesBuffer.GetData()));
+		if (HexToBytesBuffer.Num() != FAES::FAESKey::KeySize)
+		{
+			UE_LOG(LogIoStoreTools, Warning, TEXT("Ignoring Main AES Key because it has invalid size (%d bytes vs %d expected)"), HexToBytesBuffer.Num(), FAES::FAESKey::KeySize);
+		}
+		else
+		{
+			FMemory::Memcpy(EncryptionKeys.FindOrAdd(FGuid()).Key, HexToBytesBuffer.GetData(), HexToBytesBuffer.Num());
+		}
+	}
+
 	TArray<FString> FilterStrings;
 	if (!Filter.IsEmpty())
 	{
@@ -193,12 +212,14 @@ bool FIOStoreTools::ExecuteIOStoreTools(const TCHAR* Cmd)
 		{
 			EncryptionKeysFile = FPaths::ConvertRelativePathToFull( EncryptionKeysFile );
 		}
-		// Legacy argument support, it should not have a forward slash
-		else if ( FParse::Value( Cmd, TEXT("-EncryptionKeys="), EncryptionKeysFile ) )
-		{
-			EncryptionKeysFile = FPaths::ConvertRelativePathToFull( EncryptionKeysFile );
-		}
+
+		FString MainAesKey;
 		
+		if (FParse::Value(Cmd, TEXT("AES="), MainAesKey) && MainAesKey.StartsWith("0x"))
+		{
+			MainAesKey = MainAesKey.RightChop(2);
+		}
+
 		ContainerFolderPath = FPaths::ConvertRelativePathToFull( ContainerFolderPath );
 		ExtractFolderRootPath = FPaths::ConvertRelativePathToFull( ExtractFolderRootPath );
 		
@@ -250,7 +271,7 @@ bool FIOStoreTools::ExecuteIOStoreTools(const TCHAR* Cmd)
 		FString PotentialPackageFilter;
 		FParse::Value( Cmd, TEXT("PackageFilter="), PotentialPackageFilter );
 
-		return ExtractPackagesFromContainers( ContainerFolderPath, ExtractFolderRootPath, EncryptionKeysFile, DefaultZenPackageVersion, PotentialPackageFilter, FilterFilePath, SkipBulkData);
+		return ExtractPackagesFromContainers( ContainerFolderPath, ExtractFolderRootPath, MainAesKey,EncryptionKeysFile, DefaultZenPackageVersion, PotentialPackageFilter, FilterFilePath, SkipBulkData);
 	}
 
 	UE_LOG( LogIoStoreTools, Display, TEXT("Unknown command. Available commands: ") );

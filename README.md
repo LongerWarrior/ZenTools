@@ -30,10 +30,11 @@ And `FFileHelper::SaveArrayToFile` signature to supports TArrayView64
 
 ## Usage:
 
-`ZenTools ExtractPackages <ContainerFolderPath> <ExtractionDir> [-EncryptionKeys=<KeyFile>] [-ZenPackageVersion=<Initial/DataResourceTable/Latest>] [-SkipBulkData] [-PackageFilter=<Package/Path/Filter>] [-Filter=<FilterFile>]`
+`ZenTools ExtractPackages <ContainerFolderPath> <ExtractionDir> [-Aes=<MainAesKey>] [-EncryptionKeys=<KeyFile>] [-ZenPackageVersion=<Initial/DataResourceTable/Latest>] [-SkipBulkData] [-PackageFilter=<Package/Path/Filter>] [-Filter=<FilterFile>]`
 
 - `ContainerFolderPath` - Path to the folder containing the container files (.ucas/.utoc + .pak).
 - `ExtractionDir` - Path to the folder where the extracted packages will be saved.
+- `MainAesKey` - Main AES key for the game.
 - `KeyFile` - Path to the file containing encryption keys.
 - `ZenPackageVersion` - Version of the ZenPackage format to use. Default is `Latest`. `Initial` for UE5.1
 - `SkipBulkData` - Skip extracting bulk data.
@@ -63,3 +64,4 @@ Since the game in the above example needs an AES key, this is the following `key
   "00000000-0000-0000-0000-000000000000": "DEADBEEFCAFEDEADBEEFCAFEDEADBEEFCAFEDEADBEEFCAFEDEADBEEFCAFEDEAD"
 }
 ```
+or use `-AES=DEADBEEFCAFEDEADBEEFCAFEDEADBEEFCAFEDEADBEEFCAFEDEADBEEFCAFEDEAD` instead.
